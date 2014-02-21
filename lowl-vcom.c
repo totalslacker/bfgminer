@@ -960,36 +960,39 @@ int serial_open(const char *devpath, unsigned long baud, uint8_t timeout, bool p
 		return -1;
 	}
 
-	if (baud)
-	{
+// 	if (baud)
+// 	{
+// 
+// 	COMMCONFIG comCfg = {0};
+// 	comCfg.dwSize = sizeof(COMMCONFIG);
+// 	comCfg.wVersion = 1;
+// 	comCfg.dcb.DCBlength = sizeof(DCB);
+// 	comCfg.dcb.BaudRate = baud;
+// 	comCfg.dcb.fBinary = 1;
+// 	comCfg.dcb.fDtrControl = DTR_CONTROL_ENABLE;
+// 	comCfg.dcb.fRtsControl = RTS_CONTROL_ENABLE;
+// 	comCfg.dcb.ByteSize = 8;
+// 
+// 	SetCommConfig(hSerial, &comCfg, sizeof(comCfg));
+// 
+// 	}
+// 
+// 	// Code must specify a valid timeout value (0 means don't timeout)
+// 	const DWORD ctoms = ((DWORD)timeout * 100);
+// 	COMMTIMEOUTS cto = {ctoms, 0, ctoms, 0, ctoms};
+// 	SetCommTimeouts(hSerial, &cto);
+// 
+// 	if (purge) {
+// 		PurgeComm(hSerial, PURGE_RXABORT);
+// 		PurgeComm(hSerial, PURGE_TXABORT);
+// 		PurgeComm(hSerial, PURGE_RXCLEAR);
+// 		PurgeComm(hSerial, PURGE_TXCLEAR);
+// 	}
 
-	COMMCONFIG comCfg = {0};
-	comCfg.dwSize = sizeof(COMMCONFIG);
-	comCfg.wVersion = 1;
-	comCfg.dcb.DCBlength = sizeof(DCB);
-	comCfg.dcb.BaudRate = baud;
-	comCfg.dcb.fBinary = 1;
-	comCfg.dcb.fDtrControl = DTR_CONTROL_ENABLE;
-	comCfg.dcb.fRtsControl = RTS_CONTROL_ENABLE;
-	comCfg.dcb.ByteSize = 8;
-
-	SetCommConfig(hSerial, &comCfg, sizeof(comCfg));
-
-	}
-
-	// Code must specify a valid timeout value (0 means don't timeout)
-	const DWORD ctoms = ((DWORD)timeout * 100);
-	COMMTIMEOUTS cto = {ctoms, 0, ctoms, 0, ctoms};
-	SetCommTimeouts(hSerial, &cto);
-
-	if (purge) {
-		PurgeComm(hSerial, PURGE_RXABORT);
-		PurgeComm(hSerial, PURGE_TXABORT);
-		PurgeComm(hSerial, PURGE_RXCLEAR);
-		PurgeComm(hSerial, PURGE_TXCLEAR);
-	}
-
-	return _open_osfhandle((intptr_t)hSerial, 0);
+	applog(LOG_ERR, ">>> !!!");
+	const int fd= _open_osfhandle((intptr_t)hSerial, 0);
+	applog(LOG_ERR, ">>> !!! - ", bfg_strerror(errno, BST_ERRNO));
+	return fd;
 #else
 	int fdDev = open(devpath, O_RDWR | O_CLOEXEC | O_NOCTTY);
 
