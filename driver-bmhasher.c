@@ -302,7 +302,7 @@ bool bmhasher_detect_one(const char * const devpath)
 
 	serial_close(fd);
 
-	const int expectlen = sizeof(HelloResponsePacket) - sizeof(BMPacketHeader);
+	const int expectlen = 1;
 	if (responsePacket.header.length < expectlen)
 	{
 		applog(LOG_DEBUG, "%s: USB_INIT response too short on %s (%d < %d)",
@@ -314,6 +314,9 @@ bool bmhasher_detect_one(const char * const devpath)
 	if (serial_claim_v(devpath, &bmhasher_drv))
 		return false;
 	
+	applog(LOG_DEBUG, "%s: Opening BMHasher on %s",
+	        __func__, devpath);
+
 	struct cgpu_info * const cgpu = malloc(sizeof(*cgpu));
 	*cgpu = (struct cgpu_info){
 		.drv = &bmhasher_drv,
