@@ -918,6 +918,20 @@ if test "x$hashfast" = xyes; then
 fi
 AM_CONDITIONAL([USE_HASHFAST], [test x$hashfast = xyes])
 
+driverlist="$driverlist bmhasher"
+bmhasher=yes
+AC_ARG_ENABLE([bmhasher],
+	[AC_HELP_STRING([--disable-bmhasher],[Compile support for BMHasher (default enabled)])],
+	[bmhasher=$enableval]
+)
+if test "x$bmhasher" = xyes; then
+	AC_DEFINE([USE_BMHASHER], [1], [Defined to 1 if BMHasher support is wanted])
+	need_lowl_vcom=yes
+	has_asic=yes
+	have_udevrules=true
+fi
+AM_CONDITIONAL([USE_BMHASHER], [test x$bmhasher = xyes])
+
 
 driverlist="$driverlist metabank"
 metabank=no
