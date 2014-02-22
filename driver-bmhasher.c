@@ -267,11 +267,16 @@ static const struct bfg_set_device_definition bmhasher_set_device_funcs_probe[] 
 	{NULL},
 };
 
+struct bmhasher_detection_state {
+	uint8_t moduleCount;
+};
+
 static
 bool bmhasher_detect_one(const char * const devpath)
 {
 	uint16_t clock = 200;
 	BMPacket hello = {0};
+	struct bmhasher_detection_state * detectState;
 	HelloResponsePacket responsePacket;
 
 	const int fd = serial_open(devpath, 115200, 100, true);
@@ -317,15 +322,21 @@ bool bmhasher_detect_one(const char * const devpath)
 	applog(LOG_DEBUG, "%s: Opening BMHasher on %s",
 	        __func__, devpath);
 
+	detectState = malloc(sizeof(*detectState));
+	*detectState = (struct bmhasher_detection_state)
+	{
+		.moduleCount = 1,		// FIXME: actual number of modules!
+	};
+
 	struct cgpu_info * const cgpu = malloc(sizeof(*cgpu));
 	*cgpu = (struct cgpu_info){
 		.drv = &bmhasher_drv,
 		.device_path = strdup(devpath),
 		.deven = DEV_ENABLED,
 		// .procs = (pmsg->chipaddr * pmsg->coreaddr),
-		.procs = (4),
+		.procs = 1,	// FIXME: One processor per module!
 		.threads = 1,
-		.device_data = NULL,
+		.device_data = detectState,
 		.cutofftemp = 100,
 	};
 	return add_cgpu(cgpu);
@@ -348,6 +359,72 @@ bool bmhasher_lowl_match(const struct lowlevel_device_info * const info)
 	return (info->manufacturer && strstr(info->manufacturer, "HashFast"));
 }
 
+typedef unsigned long bmhasher_isn_t;
+
+#define	MAX_MODULES		32
+
+struct bmhasher_module_state {
+	struct cgpu_info *proc;
+	uint8_t addr;
+	uint8_t last_seq;
+	bmhasher_isn_t last_isn;
+	bmhasher_isn_t last2_isn;
+	bool has_pending;
+	unsigned queued;
+	// float voltages[HASHFAST_MAX_VOLTAGES];
+};
+
+struct bmhasher_chain_state {
+	uint8_t module_count;
+	int fd;
+	struct bmhasher_module_state modules[MAX_MODULES];
+};
+
+static
+bool bmhasher_init(struct thr_info * const master_thr)
+{
+	struct cgpu_info * const dev = master_thr->cgpu, *proc;
+	struct bmhasher_chain_state * const chainstate = calloc(1, sizeof(*chainstate));
+	struct bmhasher_module_state * modstate;
+	struct bmhasher_detection_state * detectState = dev->device_data;
+	int i;
+
+	applog(LOG_DEBUG, "%s: moduleCount %d",
+	        __func__, detectState->moduleCount);
+
+	*chainstate = (struct bmhasher_chain_state)
+	{
+		.module_count = 1,
+		.fd = serial_open(dev->device_path, 0, 1, true),
+	};
+	
+	for (i = 0; i < detectState->moduleCount; ++i)
+	{
+		modstate = &chainstate->modules[i];
+		*modstate = (struct bmhasher_module_state)
+		{
+			.addr = i,		// FIXME: We don't know this...
+		};
+	}
+	
+	for ((i = 0), (proc = dev); proc; ++i, (proc = proc->next_proc))
+	{
+		struct thr_info * const thr = proc->thr[0];
+		// const bool core_is_working = pmsg->data[0x20 + (i / 8)] & (1 << (i % 8));
+		
+		// if (!core_is_working)
+		// 	proc->deven = DEV_RECOVER_DRV;
+		proc->device_data = chainstate;
+		modstate = &chainstate->modules[i];
+		thr->cgpu_data = modstate;
+		modstate->proc = proc;
+	}
+	
+	// TODO: actual clock = [12,13]
+	
+	timer_set_now(&master_thr->tv_poll);
+	return true;
+}
 
 struct device_drv bmhasher_drv = {
 	.dname = "bmhasher",
@@ -356,7 +433,7 @@ struct device_drv bmhasher_drv = {
 	.lowl_match = bmhasher_lowl_match,
 	.lowl_probe = bmhasher_lowl_probe,
 	
-	// .thread_init = hashfast_init,
+	.thread_init = bmhasher_init,
 	
 	// .minerloop = minerloop_queue,
 	// .queue_append = hashfast_queue_append,
