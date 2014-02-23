@@ -25,6 +25,7 @@
 
 BFG_REGISTER_DRIVER(bmhasher_drv)
 
+#define BMHASHER_QUEUE_MEMORY 0x20
 
 /********** temporary helper for hexdumping SPI traffic */
 #define DEBUG_HEXDUMP 1
@@ -83,6 +84,7 @@ typedef struct HelloResponsePacket
 typedef struct WorkPacket
 {
 	BMPacketHeader	header;
+	uint16_t		seq;
 	uint8_t			midstate[32];
 	uint8_t			data[12];
 } WorkPacket;
@@ -203,6 +205,7 @@ ssize_t bmhasher_read(const int fd, void * const buf, size_t bufsz)
 	}
 	return rv;
 }
+
 int SendPacket(int fd, int moduleIndex, BMPacket * packet)
 {
 	int sendLength;
@@ -215,7 +218,8 @@ int SendPacket(int fd, int moduleIndex, BMPacket * packet)
 
 	dbghexdump("SendPacket", (uint8_t *) packet, sendLength);
 
-	return (sendLength == bmhasher_write(fd, packet, sendLength));
+	amountSent = bmhasher_write(fd, packet, sendLength);
+	return (sendLength == amountSent) ? 0 : -1;
 }
 
 int ReceivePacket(int fd, BMPacket * packet)
@@ -389,15 +393,16 @@ bool bmhasher_init(struct thr_info * const master_thr)
 	struct bmhasher_detection_state * detectState = dev->device_data;
 	int i;
 
-	applog(LOG_DEBUG, "%s: moduleCount %d",
-	        __func__, detectState->moduleCount);
+	applog(LOG_DEBUG, "%s: moduleCount %d", __func__, detectState->moduleCount);
 
 	*chainstate = (struct bmhasher_chain_state)
 	{
 		.module_count = 1,
-		.fd = serial_open(dev->device_path, 0, 1, true),
+		.fd = serial_open(dev->device_path, 115200, 1, true),
 	};
 	
+	applog(LOG_DEBUG, "%s: chainstate->fd=%d", __func__, chainstate->fd);
+
 	for (i = 0; i < detectState->moduleCount; ++i)
 	{
 		modstate = &chainstate->modules[i];
@@ -423,7 +428,112 @@ bool bmhasher_init(struct thr_info * const master_thr)
 	// TODO: actual clock = [12,13]
 	
 	timer_set_now(&master_thr->tv_poll);
+	applog(LOG_DEBUG, "%s: finishing", __func__);
 	return true;
+}
+
+static
+bool bmhasher_queue_append(struct thr_info * const thr, struct work * const work)
+{
+	struct cgpu_info * const proc = thr->cgpu;
+	struct bmhasher_chain_state * const chainstate = proc->device_data;
+	const int fd = chainstate->fd;
+	struct bmhasher_module_state * const modstate = thr->cgpu_data;
+	bmhasher_isn_t isn;
+	uint8_t seq;
+	WorkPacket workPacket = {0};
+	
+	applog(LOG_DEBUG, "%s: has_pending=%d", __func__, modstate->has_pending);
+
+	if (modstate->has_pending)
+	{
+		thr->queue_full = true;
+		return false;
+	}
+	
+	isn = ++modstate->last_isn;
+	seq = ++modstate->last_seq;
+	work->device_id = seq;
+	modstate->last_isn = isn;
+
+	workPacket.header.type = kWorkPacketType;
+	workPacket.header.length = 46;
+	workPacket.seq = seq;
+	memcpy(workPacket.midstate, work->midstate, 32);
+	memcpy(workPacket.data, &work->data[64], 12);
+	modstate->has_pending = true;
+
+	if (SendPacket(fd, modstate->addr, (BMPacket *) &workPacket) < 0)
+	{
+		applog(LOG_DEBUG, "%s: error sending work packet", __func__);
+		return false;
+	}
+
+	DL_APPEND(thr->work, work);
+	if (modstate->queued > BMHASHER_QUEUE_MEMORY)
+	{
+		struct work * const old_work = thr->work;
+		DL_DELETE(thr->work, old_work);
+		free_work(old_work);
+	}
+	else
+	{
+		++modstate->queued;
+	}
+
+	return true;
+}
+
+static
+void bmhasher_poll(struct thr_info * const master_thr)
+{
+	struct cgpu_info * const dev = master_thr->cgpu;
+	struct timeval tv_timeout;
+	timer_set_delay_from_now(&tv_timeout, 10000);
+#if 0
+	while (true)
+	{
+		if (!hashfast_poll_msg(master_thr))
+		{
+			applog(LOG_DEBUG, "%s poll: No more messages", dev->dev_repr);
+			break;
+		}
+		if (timer_passed(&tv_timeout, NULL))
+		{
+			applog(LOG_DEBUG, "%s poll: 10ms timeout met", dev->dev_repr);
+			break;
+		}
+	}
+#else
+	applog(LOG_DEBUG, "%s", __func__);
+#endif
+	
+	timer_set_delay_from_now(&master_thr->tv_poll, 100000);
+}
+
+static
+void bmhasher_queue_flush(struct thr_info * const thr)
+{
+#if 0
+	struct cgpu_info * const proc = thr->cgpu;
+	struct hashfast_dev_state * const devstate = proc->device_data;
+	const int fd = devstate->fd;
+	struct hashfast_core_state * const cs = thr->cgpu_data;
+	uint8_t cmd[HASHFAST_HEADER_SIZE];
+	uint16_t hdata = 2;
+	if ((!thr->work) || stale_work(thr->work->prev, true))
+	{
+		applog(LOG_DEBUG, "%"PRIpreprv": Flushing both active and pending work",
+		       proc->proc_repr);
+		hdata |= 1;
+	}
+	else
+		applog(LOG_DEBUG, "%"PRIpreprv": Flushing pending work",
+		       proc->proc_repr);
+	hashfast_send_msg(fd, cmd, HFOP_ABORT, cs->chipaddr, cs->coreaddr, hdata, 0);
+#else
+	applog(LOG_DEBUG, "%s", __func__);
+#endif
 }
 
 struct device_drv bmhasher_drv = {
@@ -435,10 +545,10 @@ struct device_drv bmhasher_drv = {
 	
 	.thread_init = bmhasher_init,
 	
-	// .minerloop = minerloop_queue,
-	// .queue_append = hashfast_queue_append,
-	// .queue_flush = hashfast_queue_flush,
-	// .poll = hashfast_poll,
+	.minerloop = minerloop_queue,
+	.queue_append = bmhasher_queue_append,
+	.queue_flush = bmhasher_queue_flush,
+	.poll = bmhasher_poll,
 	
 	// .get_api_stats = hashfast_api_stats,
 	
