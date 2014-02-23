@@ -53,7 +53,7 @@ enum PacketTypes
 {
 	kHelloPacketType,
 	kWorkPacketType,
-	kRequestNoncesPacketType,
+	kRequestStatusPacketType,
 	kStopPacketType,
 };
 
@@ -89,14 +89,23 @@ typedef struct WorkPacket
 	uint8_t			data[12];
 } WorkPacket;
 
+typedef struct WorkResult
+{
+	uint32_t		nonce;
+	uint16_t		complete		: 1;
+	uint16_t		hasNonce		: 1;
+	uint16_t		reserved		: 14;
+	uint16_t		seq;
+} WorkResult;
+
 typedef struct StatusResponsePacket
 {
 	BMPacketHeader	header;
 	uint8_t			remainingWork;
 	uint8_t			desiredWork;
-	uint8_t			remainingNonces;
-	uint8_t			nonceCount;
-	uint32_t		nonces[16];
+	uint8_t			remainingResults;
+	uint8_t			resultsCount;
+	WorkResult		workResults[16];
 } StatusResponsePacket;
 
 uint16_t crc16(uint16_t crcval, void *data_p, int count)
@@ -487,9 +496,43 @@ bool bmhasher_queue_append(struct thr_info * const thr, struct work * const work
 static
 void bmhasher_poll(struct thr_info * const master_thr)
 {
-	struct cgpu_info * const dev = master_thr->cgpu;
+	struct cgpu_info * const proc = master_thr->cgpu;
+	struct bmhasher_chain_state * const chainstate = proc->device_data;
+	const int fd = chainstate->fd;
 	struct timeval tv_timeout;
+	BMPacket statusPacket;
+	StatusResponsePacket statusReponsePacket;
+
+	// FIXME: This timeout is likely way too long? 10ms?
 	timer_set_delay_from_now(&tv_timeout, 10000);
+
+	statusPacket.header.type = kRequestStatusPacketType;
+	statusPacket.header.length = 0;
+	SendPacket(fd, 0, &statusPacket);
+
+	while (true)
+	{
+		if (!ReceivePacket(fd, (BMPacket *) &statusReponsePacket))
+		{
+			applog(LOG_DEBUG, "%s: Failed to parse response", __func__);
+		}
+
+		if (statusReponsePacket.header.type == kRequestStatusPacketType)
+		{
+			applog(LOG_DEBUG, "%s: got status response packet", __func__);
+			applog(LOG_DEBUG, "%s: remainingWork=%u", __func__, statusReponsePacket.remainingWork);
+			applog(LOG_DEBUG, "%s: desiredWork=%u", __func__, statusReponsePacket.desiredWork);
+			applog(LOG_DEBUG, "%s: remainingResults=%u", __func__, statusReponsePacket.remainingResults);
+			applog(LOG_DEBUG, "%s: resultsCount=%u", __func__, statusReponsePacket.resultsCount);
+			break;
+		}
+
+		if (timer_passed(&tv_timeout, NULL))
+		{
+			applog(LOG_DEBUG, "%s poll: 10ms timeout met", proc->dev_repr);
+			break;
+		}
+	}
 #if 0
 	while (true)
 	{
