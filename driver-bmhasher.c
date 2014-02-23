@@ -98,6 +98,8 @@ typedef struct WorkResult
 	uint16_t		seq;
 } WorkResult;
 
+#define	STATUS_MAX_RESULTS		16
+
 typedef struct StatusResponsePacket
 {
 	BMPacketHeader	header;
@@ -105,7 +107,7 @@ typedef struct StatusResponsePacket
 	uint8_t			desiredWork;
 	uint8_t			remainingResults;
 	uint8_t			resultsCount;
-	WorkResult		workResults[16];
+	WorkResult		workResults[STATUS_MAX_RESULTS];
 } StatusResponsePacket;
 
 uint16_t crc16(uint16_t crcval, void *data_p, int count)
@@ -379,7 +381,7 @@ typedef unsigned long bmhasher_isn_t;
 struct bmhasher_module_state {
 	struct cgpu_info *proc;
 	uint8_t addr;
-	uint8_t last_seq;
+	uint16_t last_seq;
 	bmhasher_isn_t last_isn;
 	bmhasher_isn_t last2_isn;
 	bool has_pending;
@@ -441,6 +443,23 @@ bool bmhasher_init(struct thr_info * const master_thr)
 	return true;
 }
 
+uint32_t get_diff(double diff)
+{
+	uint32_t n_bits;
+	int shift = 29;
+	double f = (double) 0x0000ffff / diff;
+	while (f < (double) 0x00008000) {
+		shift--;
+		f *= 256.0;
+	}
+	while (f >= (double) 0x00800000) {
+		shift++;
+		f /= 256.0;
+	}
+	n_bits = (int) f + (shift << 24);
+	return n_bits;
+}
+
 static
 bool bmhasher_queue_append(struct thr_info * const thr, struct work * const work)
 {
@@ -449,7 +468,7 @@ bool bmhasher_queue_append(struct thr_info * const thr, struct work * const work
 	const int fd = chainstate->fd;
 	struct bmhasher_module_state * const modstate = thr->cgpu_data;
 	bmhasher_isn_t isn;
-	uint8_t seq;
+	uint16_t seq;
 	WorkPacket workPacket = {0};
 	
 	applog(LOG_DEBUG, "%s: has_pending=%d", __func__, modstate->has_pending);
@@ -471,6 +490,10 @@ bool bmhasher_queue_append(struct thr_info * const thr, struct work * const work
 	memcpy(workPacket.midstate, work->midstate, 32);
 	memcpy(workPacket.data, &work->data[64], 12);
 	modstate->has_pending = true;
+
+
+	uint32_t diff = get_diff(work->sdiff);
+	applog(LOG_DEBUG, "difficulty=0x%08x", diff);
 
 	if (SendPacket(fd, modstate->addr, (BMPacket *) &workPacket) < 0)
 	{
@@ -494,6 +517,47 @@ bool bmhasher_queue_append(struct thr_info * const thr, struct work * const work
 }
 
 static
+struct cgpu_info *bmhasher_find_proc(struct thr_info * const master_thr, int modaddr)
+{
+	struct cgpu_info *proc = master_thr->cgpu;
+	struct bmhasher_chain_state * const chainstate = proc->device_data;
+
+	if (modaddr >= chainstate->module_count)
+		return NULL;
+
+	struct bmhasher_module_state * const modstate = &chainstate->modules[modaddr];
+
+	return modstate->proc;
+}
+
+static
+void bmhasher_submit_nonce(struct thr_info * const thr, struct work * const work, const uint32_t nonce)
+{
+	struct cgpu_info * const proc = thr->cgpu;
+	struct bmhasher_module_state * const modstate = thr->cgpu_data;
+	
+	applog(LOG_DEBUG, "%"PRIpreprv": Found nonce for seq %04x (last=%04x): %08lx",
+	       proc->proc_repr, (unsigned) work->device_id, (unsigned) modstate->last_seq,
+	       (unsigned long) nonce);
+
+	{
+		char hash_str[65];
+		int ok;
+
+		ok = test_nonce2(work, nonce);
+		if (ok == 0)
+		{
+			applog(LOG_DEBUG, "%"PRIpreprv": FOUND GOOD NONCE!!!", proc->proc_repr);
+		}
+		applog(LOG_DEBUG, "%"PRIpreprv": test_nonce=%d", proc->proc_repr, ok);
+		bin2hex(hash_str, work->hash, 32);
+		applog(LOG_DEBUG, "%"PRIpreprv": seq=%04x hash=%s", proc->proc_repr, (unsigned) work->device_id, hash_str);
+	}
+
+	submit_nonce(thr, work, nonce);
+}
+
+static
 void bmhasher_poll(struct thr_info * const master_thr)
 {
 	struct cgpu_info * const proc = master_thr->cgpu;
@@ -502,6 +566,8 @@ void bmhasher_poll(struct thr_info * const master_thr)
 	struct timeval tv_timeout;
 	BMPacket statusPacket;
 	StatusResponsePacket statusReponsePacket;
+
+	// FIXME: This needs to iterate through all modules! Or perhaps do a single module each time it's called?
 
 	// FIXME: This timeout is likely way too long? 10ms?
 	timer_set_delay_from_now(&tv_timeout, 10000);
@@ -519,11 +585,74 @@ void bmhasher_poll(struct thr_info * const master_thr)
 
 		if (statusReponsePacket.header.type == kRequestStatusPacketType)
 		{
+#if 0
 			applog(LOG_DEBUG, "%s: got status response packet", __func__);
 			applog(LOG_DEBUG, "%s: remainingWork=%u", __func__, statusReponsePacket.remainingWork);
 			applog(LOG_DEBUG, "%s: desiredWork=%u", __func__, statusReponsePacket.desiredWork);
 			applog(LOG_DEBUG, "%s: remainingResults=%u", __func__, statusReponsePacket.remainingResults);
 			applog(LOG_DEBUG, "%s: resultsCount=%u", __func__, statusReponsePacket.resultsCount);
+#endif
+
+			// submit the work results
+			struct cgpu_info * const proc = bmhasher_find_proc(master_thr, statusReponsePacket.header.address);
+			if (unlikely(!proc))
+			{
+				applog(LOG_ERR, "%s: Unknown module address %u",
+				       proc->dev_repr, (unsigned) statusReponsePacket.header.address);
+				inc_hw_errors_only(master_thr);
+				continue;
+			}
+			struct thr_info * const thr = proc->thr[0];
+			struct bmhasher_module_state * const modstate = thr->cgpu_data;
+			unsigned nonces_found = 0;
+
+			// unblock the queue if the module is needing work
+			if (statusReponsePacket.desiredWork > 0)
+			{
+				modstate->has_pending = false;
+				thr->queue_full = false;
+			}
+
+			// go post any results
+			for (int index = 0; index < statusReponsePacket.resultsCount; index++)
+			{
+				struct work *work;
+				uint16_t seq;
+				WorkResult * workResult = &statusReponsePacket.workResults[index];
+
+				seq = workResult->seq;
+
+				// find the matching work
+				DL_SEARCH_SCALAR(thr->work, work, device_id, seq);
+				if (unlikely(!work))
+				{
+					applog(LOG_WARNING, "%"PRIpreprv": Unknown seq %04x (last=%04x)",
+					       proc->proc_repr, (unsigned) seq, (unsigned) modstate->last_seq);
+					inc_hw_errors2(thr, NULL, &workResult->nonce);
+					continue;
+				}
+				
+				// was a nonce found?
+				if (workResult->hasNonce)
+				{
+					uint32_t nonce;
+
+					applog(LOG_WARNING, "%"PRIpreprv": Found nonce seq %04x", proc->proc_repr, (unsigned) work->device_id);
+					// nonce = htobe32(workResult->nonce);
+					nonce = workResult->nonce;
+					nonces_found++;
+					bmhasher_submit_nonce(thr, work, nonce);
+				}
+
+				// is the work done?
+				if (workResult->complete)
+				{
+					// job is complete, but we leave it in queue where it's deleted at append
+					// FIXME: Verify that this is the best thing to do...
+					applog(LOG_DEBUG, "%"PRIpreprv": Work Complete seq %04x", proc->proc_repr, (unsigned) seq);
+				}
+			}
+
 			break;
 		}
 
