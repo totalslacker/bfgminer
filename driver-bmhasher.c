@@ -491,6 +491,18 @@ bool bmhasher_queue_append(struct thr_info * const thr, struct work * const work
 	memcpy(workPacket.data, &work->data[64], 12);
 	modstate->has_pending = true;
 
+#if 0
+	char midstateStr[65];
+	char dataStr[65];
+
+	bin2hex(midstateStr, work->midstate, 32);
+	bin2hex(dataStr, &work->data[64], 12);
+	applog(LOG_DEBUG, "seq=0x%04x midstate=%s data=%s", workPacket.seq, midstateStr, dataStr);
+
+	bin2hex(midstateStr, workPacket.midstate, 32);
+	bin2hex(dataStr, workPacket.data, 12);
+	applog(LOG_DEBUG, "seq=0x%04x packet midstate=%s data=%s", workPacket.seq, midstateStr, dataStr);
+#endif
 
 	uint32_t diff = get_diff(work->sdiff);
 	applog(LOG_DEBUG, "difficulty=0x%08x", diff);
@@ -540,6 +552,7 @@ void bmhasher_submit_nonce(struct thr_info * const thr, struct work * const work
 	       proc->proc_repr, (unsigned) work->device_id, (unsigned) modstate->last_seq,
 	       (unsigned long) nonce);
 
+#if 0
 	{
 		char hash_str[65];
 		int ok;
@@ -553,6 +566,7 @@ void bmhasher_submit_nonce(struct thr_info * const thr, struct work * const work
 		bin2hex(hash_str, work->hash, 32);
 		applog(LOG_DEBUG, "%"PRIpreprv": seq=%04x hash=%s", proc->proc_repr, (unsigned) work->device_id, hash_str);
 	}
+#endif
 
 	submit_nonce(thr, work, nonce);
 }
@@ -592,6 +606,8 @@ void bmhasher_poll(struct thr_info * const master_thr)
 			applog(LOG_DEBUG, "%s: remainingResults=%u", __func__, statusReponsePacket.remainingResults);
 			applog(LOG_DEBUG, "%s: resultsCount=%u", __func__, statusReponsePacket.resultsCount);
 #endif
+			applog(LOG_DEBUG, "%s: remainingWork=%u", __func__, statusReponsePacket.remainingWork);
+			applog(LOG_DEBUG, "%s: desiredWork=%u", __func__, statusReponsePacket.desiredWork);
 
 			// submit the work results
 			struct cgpu_info * const proc = bmhasher_find_proc(master_thr, statusReponsePacket.header.address);
@@ -638,8 +654,8 @@ void bmhasher_poll(struct thr_info * const master_thr)
 					uint32_t nonce;
 
 					applog(LOG_WARNING, "%"PRIpreprv": Found nonce seq %04x", proc->proc_repr, (unsigned) work->device_id);
-					// nonce = htobe32(workResult->nonce);
-					nonce = workResult->nonce;
+					nonce = htobe32(workResult->nonce);
+					// nonce = workResult->nonce;
 					nonces_found++;
 					bmhasher_submit_nonce(thr, work, nonce);
 				}
