@@ -352,8 +352,11 @@ static const struct bfg_set_device_definition bmhasher_set_device_funcs_probe[] 
 	{NULL},
 };
 
+#define	MAX_MODULES		8
+
 struct bmhasher_detection_state {
-	uint8_t moduleCount;
+	uint8_t		moduleCount;
+	uint16_t	moduleMap[MAX_MODULES];
 };
 
 static
@@ -364,7 +367,7 @@ bool bmhasher_detect_one(const char * const devpath)
 	struct bmhasher_detection_state * detectState;
 	HelloResponsePacket responsePacket;
 
-	const int fd = serial_open(devpath, 115200, 100, true);
+	const int fd = serial_open(devpath, 115200, 10, true);
 	if (fd == -1)
 	{
 		applog(LOG_DEBUG, "%s: Failed to open %s", __func__, devpath);
@@ -375,18 +378,41 @@ bool bmhasher_detect_one(const char * const devpath)
 
 	drv_set_defaults(&bmhasher_drv, bmhasher_set_device_funcs_probe, &clock, devpath, detectone_meta_info.serial, 1);
 
-	applog(LOG_DEBUG, "bmhasher_detect_one: sending hello packet");
-	SendPacket(fd, kHelloPacketType, 0, 0, &hello);
 
-	do {
-		if (!ReceivePacket(fd, (BMPacket *) &responsePacket))
+	detectState = malloc(sizeof(*detectState));
+	memset(detectState, 0, sizeof(*detectState));
+
+	// see how many modules we can connect to
+	for (int moduleAddress = 0; moduleAddress < MAX_MODULES; moduleAddress++)
+	{
+		applog(LOG_DEBUG, "bmhasher_detect_one: detecting moduleAddress=%d", moduleAddress);
+		SendPacket(fd, kHelloPacketType, moduleAddress, 0, &hello);
+
+		while (true)
 		{
-			applog(LOG_DEBUG, "%s: Failed to parse response on %s",
-			        __func__, devpath);
-			serial_close(fd);
-			goto err;
+			if (ReceivePacket(fd, (BMPacket *) &responsePacket))
+			{
+				if (responsePacket.header.type == kHelloPacketType)
+				{
+					applog(LOG_DEBUG, "bmhasher_detect_one: got response from moduleAddress=%d", moduleAddress);
+					detectState->moduleMap[detectState->moduleCount++] = moduleAddress;
+					break;
+				}
+				else
+				{
+					applog(LOG_DEBUG, "bmhasher_detect_one: invalid packet (type=%d) from moduleAddress=%d",
+						responsePacket.header.type, moduleAddress);
+				}
+			}
+			else
+			{
+				applog(LOG_DEBUG, "bmhasher_detect_one: no response from moduleAddress=%d", moduleAddress);
+				break;
+			}
 		}
-	} while (responsePacket.header.type != kHelloPacketType);
+	}
+	
+	applog(LOG_DEBUG, "bmhasher_detect_one: %d modules detected", detectState->moduleCount);
 
 	serial_close(fd);
 
@@ -405,19 +431,13 @@ bool bmhasher_detect_one(const char * const devpath)
 	applog(LOG_DEBUG, "%s: Opening BMHasher on %s",
 	        __func__, devpath);
 
-	detectState = malloc(sizeof(*detectState));
-	*detectState = (struct bmhasher_detection_state)
-	{
-		.moduleCount = 1,		// FIXME: actual number of modules!
-	};
-
 	struct cgpu_info * const cgpu = malloc(sizeof(*cgpu));
 	*cgpu = (struct cgpu_info){
 		.drv = &bmhasher_drv,
 		.device_path = strdup(devpath),
 		.deven = DEV_ENABLED,
 		// .procs = (pmsg->chipaddr * pmsg->coreaddr),
-		.procs = 1,	// FIXME: One processor per module!
+		.procs = detectState->moduleCount,
 		.threads = 1,
 		.device_data = detectState,
 		.cutofftemp = 100,
@@ -444,8 +464,6 @@ bool bmhasher_lowl_match(const struct lowlevel_device_info * const info)
 
 typedef unsigned long bmhasher_isn_t;
 
-#define	MAX_MODULES		32
-
 struct bmhasher_module_state {
 	struct cgpu_info *proc;
 	uint8_t addr;
@@ -459,6 +477,7 @@ struct bmhasher_module_state {
 
 struct bmhasher_chain_state {
 	uint8_t module_count;
+	uint8_t last_module;
 	int fd;
 	struct bmhasher_module_state modules[MAX_MODULES];
 };
@@ -487,7 +506,7 @@ bool bmhasher_init(struct thr_info * const master_thr)
 		modstate = &chainstate->modules[i];
 		*modstate = (struct bmhasher_module_state)
 		{
-			.addr = i,		// FIXME: We don't know this...
+			.addr = detectState->moduleMap[i],
 		};
 	}
 	
@@ -571,7 +590,7 @@ bool bmhasher_queue_append(struct thr_info * const thr, struct work * const work
 #endif
 
 	uint32_t diff = get_diff(work->sdiff);
-	applog(LOG_DEBUG, "difficulty=0x%08x", diff);
+	applog(LOG_DEBUG, "address=%d difficulty=0x%08x", modstate->addr, diff);
 
 	if (SendPacket(fd, kWorkPacketType, modstate->addr, 46, (BMPacket *) &workPacket) < 0)
 	{
@@ -646,13 +665,22 @@ void bmhasher_poll(struct thr_info * const master_thr)
 	struct timeval tv_timeout;
 	BMPacket statusPacket;
 	StatusResponsePacket statusReponsePacket;
+	int moduleIndex;
+	int moduleAddress;
 
 	// FIXME: This needs to iterate through all modules! Or perhaps do a single module each time it's called?
+	moduleIndex = chainstate->last_module++;
+	if (chainstate->last_module > chainstate->module_count)
+	{
+		chainstate->last_module = 0;
+	}
+	moduleAddress = chainstate->modules[moduleIndex].addr;
 
 	// FIXME: This timeout is likely way too long? 10ms?
 	timer_set_delay_from_now(&tv_timeout, 10000);
 
-	SendPacket(fd, kRequestStatusPacketType, 0, 0, &statusPacket);
+	applog(LOG_DEBUG, "%s: moduleAddress=%d", __func__, moduleAddress);
+	SendPacket(fd, kRequestStatusPacketType, moduleAddress, 0, &statusPacket);
 
 	while (true)
 	{
