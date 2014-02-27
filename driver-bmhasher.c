@@ -25,6 +25,10 @@
 
 BFG_REGISTER_DRIVER(bmhasher_drv)
 
+#define LogFail(file, line) { applog(LOG_WARNING, "Failure in %s at line %d", file, line); }
+#define ExitWithErrorIf(cond, label) { if (cond) goto label; }
+#define ExitWithResultIf(cond, resultCode) { if (cond) { result = resultCode; if (resultCode < 0) { LogFail(__FILE__, __LINE__); } goto CLEANUP; } }
+
 #define BMHASHER_QUEUE_MEMORY 0x20
 
 /********** temporary helper for hexdumping SPI traffic */
@@ -64,9 +68,10 @@ typedef struct BMPacketHeader
 	uint8_t		marker;
 	uint8_t		type;
 	uint8_t		address;
-	uint8_t		length;
-	uint16_t	flags;
-	uint16_t	crc16;
+	uint8_t		flags;
+	uint16_t	length;
+	uint16_t	dataCheck;
+	uint16_t	headerCheck;
 } BMPacketHeader;
 
 typedef struct BMPacket
@@ -137,43 +142,108 @@ uint16_t crc16(uint16_t crcval, void *data_p, int count)
     return (crcval);
 }
 
-int CRCPacket(BMPacket * packet, uint16_t * crc)
+uint16_t CRCPayload(BMPacket * packet)
 {
-	*crc = 0xFFFF;
+	uint16_t crc = 0xFFFF;
 
-	// hash header except crc
-	*crc = crc16(*crc, packet, sizeof(BMPacketHeader) - 2);
-
-	// hash payload
+	// crc payload buffer
 	if (packet->header.length > 0)
 	{
-		*crc = crc16(*crc, packet->payload, packet->header.length - 2);
+		crc = crc16(crc, packet->payload, packet->header.length);
 	}
 
-	return 0;
+	return crc;
 }
 
-int BuildPacket(BMPacket * packet, int length)
+uint16_t CRCPacketHeader(BMPacketHeader * header)
 {
-	packet->header.marker = BMH_MARKER;
-	packet->header.length = length;
-	CRCPacket(packet, &packet->header.crc16);
+	uint16_t crc = 0xFFFF;
 
-	return 0;
+	// hash header except crc
+	crc = crc16(crc, header, sizeof(BMPacketHeader) - 2);
+
+	return crc;
+}
+
+int BuildPacket(BMPacket * packet, int type, int address, int length)
+{
+	int result;
+
+	packet->header.marker = BMH_MARKER;
+	packet->header.type = type;
+	packet->header.address = address;
+	packet->header.length = length;
+
+	// crc the payload first
+	packet->header.dataCheck = CRCPayload(packet);
+
+	// now crc the header
+	packet->header.headerCheck = CRCPacketHeader(&packet->header);
+
+	result = 0;
+CLEANUP:
+	if (result < 0)
+	{
+		printf("BuildPacket: result=%d\n", result);
+	}
+
+	return result;
+}
+
+int CheckPacketHeader(BMPacketHeader * header)
+{
+	int result;
+	uint16_t crc;
+
+	crc = CRCPacketHeader(header);
+	ExitWithResultIf(crc != header->headerCheck, -1);
+
+	result = 0;
+CLEANUP:
+	if (result < 0)
+	{
+		printf("CheckPacketHeader: result=%d crc=0x%04x headerCheck=0x%04x\n", result, crc, header->headerCheck);
+	}
+
+	return result;
+}
+
+int CheckPacketPayload(BMPacket * packet)
+{
+	int result;
+	uint16_t crc;
+
+	crc = CRCPayload(packet);
+	ExitWithResultIf(crc != packet->header.dataCheck, -1);
+
+	result = 0;
+CLEANUP:
+	if (result < 0)
+	{
+		printf("CheckPacketPayload: result=%d crc=0x%04x header.dataCheck=0x%04x\n", result, crc, packet->header.dataCheck);
+	}
+
+	return result;
 }
 
 int CheckPacket(BMPacket * packet)
 {
-	uint16_t crc;
+	int result;
 
-	if (packet->header.marker != BMH_MARKER)
+	result = CheckPacketHeader(&packet->header);
+	ExitWithResultIf(result < 0, result);
+
+	result = CheckPacketPayload(packet);
+	ExitWithResultIf(result < 0, result);
+
+	result = 0;
+CLEANUP:
+	if (result < 0)
 	{
-		return -1;
+		printf("CheckPacket: result=%d\n", result);
 	}
 
-	CRCPacket(packet, &crc);
-
-	return (crc == packet->header.crc16) ? 0 : -1;
+	return result;
 }
 
 static
@@ -217,14 +287,14 @@ ssize_t bmhasher_read(const int fd, void * const buf, size_t bufsz)
 	return rv;
 }
 
-int SendPacket(int fd, int moduleIndex, BMPacket * packet)
+int SendPacket(int fd, int type, int moduleIndex, int length, BMPacket * packet)
 {
 	int sendLength;
 	int amountSent;
 
 	// FIXME: Set this correctly...
 	packet->header.address = moduleIndex;
-	BuildPacket(packet, packet->header.length);
+	BuildPacket(packet, type, moduleIndex, length);
 	sendLength = packet->header.length + sizeof(BMPacketHeader);
 
 	dbghexdump("SendPacket", (uint8_t *) packet, sendLength);
@@ -306,9 +376,7 @@ bool bmhasher_detect_one(const char * const devpath)
 	drv_set_defaults(&bmhasher_drv, bmhasher_set_device_funcs_probe, &clock, devpath, detectone_meta_info.serial, 1);
 
 	applog(LOG_DEBUG, "bmhasher_detect_one: sending hello packet");
-	hello.header.type = kHelloPacketType;
-	hello.header.length = 0;
-	SendPacket(fd, 0, &hello);
+	SendPacket(fd, kHelloPacketType, 0, 0, &hello);
 
 	do {
 		if (!ReceivePacket(fd, (BMPacket *) &responsePacket))
@@ -484,8 +552,6 @@ bool bmhasher_queue_append(struct thr_info * const thr, struct work * const work
 	work->device_id = seq;
 	modstate->last_isn = isn;
 
-	workPacket.header.type = kWorkPacketType;
-	workPacket.header.length = 46;
 	workPacket.seq = seq;
 	memcpy(workPacket.midstate, work->midstate, 32);
 	memcpy(workPacket.data, &work->data[64], 12);
@@ -507,7 +573,7 @@ bool bmhasher_queue_append(struct thr_info * const thr, struct work * const work
 	uint32_t diff = get_diff(work->sdiff);
 	applog(LOG_DEBUG, "difficulty=0x%08x", diff);
 
-	if (SendPacket(fd, modstate->addr, (BMPacket *) &workPacket) < 0)
+	if (SendPacket(fd, kWorkPacketType, modstate->addr, 46, (BMPacket *) &workPacket) < 0)
 	{
 		applog(LOG_DEBUG, "%s: error sending work packet", __func__);
 		return false;
@@ -586,9 +652,7 @@ void bmhasher_poll(struct thr_info * const master_thr)
 	// FIXME: This timeout is likely way too long? 10ms?
 	timer_set_delay_from_now(&tv_timeout, 10000);
 
-	statusPacket.header.type = kRequestStatusPacketType;
-	statusPacket.header.length = 0;
-	SendPacket(fd, 0, &statusPacket);
+	SendPacket(fd, kRequestStatusPacketType, 0, 0, &statusPacket);
 
 	while (true)
 	{
@@ -653,7 +717,7 @@ void bmhasher_poll(struct thr_info * const master_thr)
 				{
 					uint32_t nonce;
 
-					applog(LOG_WARNING, "%"PRIpreprv": Found nonce seq %04x", proc->proc_repr, (unsigned) work->device_id);
+					applog(LOG_DEBUG, "%"PRIpreprv": Found nonce seq %04x", proc->proc_repr, (unsigned) work->device_id);
 					nonce = htobe32(workResult->nonce);
 					// nonce = workResult->nonce;
 					nonces_found++;
