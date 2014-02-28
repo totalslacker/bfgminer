@@ -495,7 +495,7 @@ bool bmhasher_init(struct thr_info * const master_thr)
 
 	*chainstate = (struct bmhasher_chain_state)
 	{
-		.module_count = 1,
+		.module_count = detectState->moduleCount,
 		.fd = serial_open(dev->device_path, 115200, 1, true),
 	};
 	
@@ -619,10 +619,19 @@ struct cgpu_info *bmhasher_find_proc(struct thr_info * const master_thr, int mod
 	struct cgpu_info *proc = master_thr->cgpu;
 	struct bmhasher_chain_state * const chainstate = proc->device_data;
 
-	if (modaddr >= chainstate->module_count)
-		return NULL;
+	applog(LOG_DEBUG, "%s: modaddr=%d module_count=%d", __func__, modaddr, chainstate->module_count);
 
-	struct bmhasher_module_state * const modstate = &chainstate->modules[modaddr];
+	struct bmhasher_module_state * modstate = NULL;
+	for (int i = 0; i < chainstate->module_count; i++)
+	{
+		if (chainstate->modules[i].addr == modaddr)
+		{
+			modstate = &chainstate->modules[i];
+			break;
+		}
+	}
+
+	applog(LOG_DEBUG, "%s: modaddr=%d modstate=%p", __func__, modaddr, modstate);
 
 	return modstate->proc;
 }
@@ -706,7 +715,7 @@ void bmhasher_poll(struct thr_info * const master_thr)
 			if (unlikely(!proc))
 			{
 				applog(LOG_ERR, "%s: Unknown module address %u",
-				       proc->dev_repr, (unsigned) statusReponsePacket.header.address);
+				       __func__, (unsigned) statusReponsePacket.header.address);
 				inc_hw_errors_only(master_thr);
 				continue;
 			}
