@@ -470,7 +470,8 @@ struct bmhasher_module_state {
 	uint16_t last_seq;
 	bmhasher_isn_t last_isn;
 	bmhasher_isn_t last2_isn;
-	bool has_pending;
+	int queue_depth;
+	int desired_queue_depth;
 	unsigned queued;
 	// float voltages[HASHFAST_MAX_VOLTAGES];
 };
@@ -506,6 +507,8 @@ bool bmhasher_init(struct thr_info * const master_thr)
 		modstate = &chainstate->modules[i];
 		*modstate = (struct bmhasher_module_state)
 		{
+			.queue_depth = 0,
+			.desired_queue_depth = 1,			// FIXME: Get this from the module
 			.addr = detectState->moduleMap[i],
 		};
 	}
@@ -558,9 +561,10 @@ bool bmhasher_queue_append(struct thr_info * const thr, struct work * const work
 	uint16_t seq;
 	WorkPacket workPacket = {0};
 	
-	applog(LOG_DEBUG, "%s: has_pending=%d", __func__, modstate->has_pending);
+	applog(LOG_DEBUG, "%s: addr=%d queue_depth=%d desired_queue_depth=%d",
+		__func__, modstate->addr, modstate->queue_depth, modstate->desired_queue_depth);
 
-	if (modstate->has_pending)
+	if (modstate->queue_depth >= modstate->desired_queue_depth)
 	{
 		thr->queue_full = true;
 		return false;
@@ -574,7 +578,7 @@ bool bmhasher_queue_append(struct thr_info * const thr, struct work * const work
 	workPacket.seq = seq;
 	memcpy(workPacket.midstate, work->midstate, 32);
 	memcpy(workPacket.data, &work->data[64], 12);
-	modstate->has_pending = true;
+	modstate->queue_depth++;
 
 #if 0
 	char midstateStr[65];
@@ -589,8 +593,8 @@ bool bmhasher_queue_append(struct thr_info * const thr, struct work * const work
 	applog(LOG_DEBUG, "seq=0x%04x packet midstate=%s data=%s", workPacket.seq, midstateStr, dataStr);
 #endif
 
-	uint32_t diff = get_diff(work->sdiff);
-	applog(LOG_DEBUG, "address=%d difficulty=0x%08x", modstate->addr, diff);
+	// uint32_t diff = get_diff(work->sdiff);
+	// applog(LOG_DEBUG, "address=%d difficulty=0x%08x", modstate->addr, diff);
 
 	if (SendPacket(fd, kWorkPacketType, modstate->addr, 46, (BMPacket *) &workPacket) < 0)
 	{
@@ -726,7 +730,8 @@ void bmhasher_poll(struct thr_info * const master_thr)
 			// unblock the queue if the module is needing work
 			if (statusReponsePacket.desiredWork > 0)
 			{
-				modstate->has_pending = false;
+				modstate->queue_depth = 0;
+				modstate->desired_queue_depth = statusReponsePacket.desiredWork;
 				thr->queue_full = false;
 			}
 
