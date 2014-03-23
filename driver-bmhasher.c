@@ -29,7 +29,7 @@ BFG_REGISTER_DRIVER(bmhasher_drv)
 #define ExitWithErrorIf(cond, label) { if (cond) goto label; }
 #define ExitWithResultIf(cond, resultCode) { if (cond) { result = resultCode; if (resultCode < 0) { LogFail(__FILE__, __LINE__); } goto CLEANUP; } }
 
-#define BMHASHER_QUEUE_MEMORY 0x20
+#define BMHASHER_QUEUE_MEMORY (64 * 32)
 
 /********** temporary helper for hexdumping SPI traffic */
 #define DEBUG_HEXDUMP 1
